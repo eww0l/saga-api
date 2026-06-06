@@ -234,25 +234,53 @@ def test_osrm():
         "total_puntos": len(ruta),
         "primeros_puntos": ruta[:5]
     }
+# ==========================================================================
+# 🚀 ENDPOINT CORPORATIVO CORREGIDO (Filtrado por JOIN Relacional)
+# ==========================================================================
 @router.get("-empresa")
 def obtener_pedidos_por_empresa(empresa: str = Query(..., description="Nombre de la empresa para descargar manifiesto")):
     if not empresa or not empresa.strip():
         raise HTTPException(status_code=400, detail="El parámetro 'empresa' es obligatorio.")
         
     try:
-        # Hacemos la consulta directa usando el cliente inyectado 'supabase_client.supabase'
+        # 📡 Traemos los pedidos haciendo JOIN con 'couriers' y 'empresas_courier'
+        # Filtramos usando la sintaxis de Supabase para tablas relacionadas: couriers.empresas_courier.nombre_empresa
         response = (
             supabase_client.supabase.table("pedidos")
-            .select("codigo_barra, courier_id, estado, prioridad")
-            .eq("empresa", empresa.strip())
+            .select("""
+                codigo_barra, 
+                courier_id, 
+                estado, 
+                prioridad,
+                couriers!inner(
+                    id_empresa,
+                    empresas_courier!inner(
+                        nombre_empresa
+                    )
+                )
+            """)
+            .eq("couriers.empresas_courier.nombre_empresa", empresa.strip())
             .execute()
         )
+        
+        pedidos_sucios = response.data or []
+        pedidos_limpios = []
+        
+        # 🧹 Limpiamos el JSON para que el script de Python reciba la estructura exacta que espera
+        for p in pedidos_sucios:
+            pedidos_limpios.append({
+                "codigo_barra": p.get("codigo_barra"),
+                "courier_id": p.get("courier_id"),
+                "estado": p.get("estado"),
+                "prioridad": p.get("prioridad")
+            })
         
         return {
             "status": "success",
             "empresa_consultada": empresa,
-            "total_paquetes": len(response.data or []),
-            "pedidos": response.data or []
+            "total_paquetes": len(pedidos_limpios),
+            "pedidos": pedidos_limpios
         }
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error en el backend: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en el árbol relacional del backend: {str(e)}")
