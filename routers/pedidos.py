@@ -234,3 +234,25 @@ def test_osrm():
         "total_puntos": len(ruta),
         "primeros_puntos": ruta[:5]
     }
+@router.get("-empresa")
+def obtener_pedidos_por_empresa(empresa: str = Query(..., description="Nombre de la empresa para descargar manifiesto")):
+    if not empresa or not empresa.strip():
+        raise HTTPException(status_code=400, detail="El parámetro 'empresa' es obligatorio.")
+        
+    try:
+        # Hacemos la consulta directa usando el cliente inyectado 'supabase_client.supabase'
+        response = (
+            supabase_client.supabase.table("pedidos")
+            .select("codigo_barra, courier_id, estado, prioridad")
+            .eq("empresa", empresa.strip())
+            .execute()
+        )
+        
+        return {
+            "status": "success",
+            "empresa_consultada": empresa,
+            "total_paquetes": len(response.data or []),
+            "pedidos": response.data or []
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en el backend: {str(e)}")
