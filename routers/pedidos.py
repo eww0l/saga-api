@@ -51,7 +51,7 @@ def obtener_ruta_osrm(coordenadas):
         print("OSRM EXCEPTION:", e)
         return []
 
-@router.get("/pedidos-courier")
+@router.get("&-courier")
 def obtener_pedidos_por_courier(
     courier_id: str = Query(..., min_length=1),
     empresa: str = Query(..., description="Nombre de la empresa seleccionada en el login"),
