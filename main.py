@@ -1,59 +1,42 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from database import supabase
+import uvicorn
+from routers import pedidos, google_maps # 🆕 Agregado google_maps
 
-app = FastAPI(title="Saga Falabella Logistics API")
+# Importamos el enrutador modular que creamos
+from routers import pedidos
 
+app = FastAPI(
+    title="Saga Falabella - E-Commerce Last Mile API",
+    description="Sistema modular de optimización y trazabilidad para distribución de última milla.",
+    version="1.0.0"
+)
+
+# Configuración obligatoria de CORS para permitir conexiones desde Flutter Web / Chrome
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Registramos el módulo de pedidos en el servidor central
+
+
+app.include_router(pedidos.router)
+app.include_router(google_maps.router)
 
 @app.get("/")
-def inicio():
-    return {"estado": "online", "mensaje": "API de Logística Saga Falabella"}
+def check_health():
+    """Ruta raíz para verificar que el backend responda en local o en Render."""
+    return {
+        "status": "online",
+        "entidad": "Saga Falabella S.A.C.",
+        "modulo": "Distribución Última Milla"
+    }
 
+# Arranque automático exclusivo para ejecución en tu PC local
 
-@app.get("/api/pedido-abierto")
-def obtener_pedido():
-    """Endpoint legado — mantiene compatibilidad con el prototipo anterior."""
-    try:
-        response = supabase.table("pedidos").select("*").execute()
-        if not response.data:
-            raise HTTPException(status_code=404, detail="No hay pedidos registrados.")
-        return {"pedido": response.data[0]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/pedidos-courier")
-def obtener_pedidos_por_courier(
-    courier_id: str = Query(..., min_length=1, description="ID del courier asignado")
-):
-    """
-    Devuelve todos los pedidos asignados a un courier específico.
-    Parámetro: ?courier_id=C-001
-    """
-    try:
-        response = (
-            supabase.table("pedidos")
-            .select("id, cliente_direccion, courier_id, created_at")
-            .eq("courier_id", courier_id)
-            .order("created_at", desc=False)   # orden cronológico = hoja de ruta natural
-            .execute()
-        )
-
-        return {
-            "courier_id": courier_id,
-            "total_pedidos": len(response.data),
-            "pedidos": response.data,
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
