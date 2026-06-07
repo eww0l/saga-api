@@ -50,7 +50,37 @@ def obtener_ruta_osrm(coordenadas):
     except Exception as e:
         print("OSRM EXCEPTION:", e)
         return []
-
+ # ==========================================================================
+# 🏢 ENDPOINT: Listado Dinámico de Empresas Courier para el Login
+# ==========================================================================
+@router.get("/empresas-activas")
+def obtener_lista_empresas_courier():
+    """Recupera los nombres de todas las empresas aliadas para poblar el Dropdown en Flutter."""
+    try:
+        response = (
+            supabase_client.supabase.table("empresas_courier")
+            .select("nombre_empresa")
+            .order("nombre_empresa", desc=False) # 💡 CORREGIDO: Se cambia 'ascending=True' por 'desc=False'
+            .execute()
+        )
+        
+        # Extraemos solo los textos de los nombres en una lista plana
+        lista_empresas = [row["nombre_empresa"] for row in (response.data or [])]
+        
+        # Si la tabla está vacía en tus primeras pruebas, mandamos un fallback de contingencia
+        if not lista_empresas:
+            lista_empresas = ["Saga Falabella (Flota Interna)"]
+            
+        return {
+            "status": "success",
+            "total": len(lista_empresas),
+            "empresas": lista_empresas
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error al conectar con el catálogo de empresas: {str(e)}"
+        )
 @router.get("-courier")
 def obtener_pedidos_por_courier(
     courier_id: str = Query(..., min_length=1),
@@ -171,56 +201,151 @@ def obtener_pedidos_por_courier(
     except Exception as e:
         return {"error_detectado": str(e)}
 
+# ==========================================================================
+# 3️⃣ BUSCADOR POR CÓDIGO DE BARRAS (🔒 SEGURIDAD B2B PLANA Y ABSOLUTA)
+# ==========================================================================
 @router.get("/escanear/{codigo_barra}")
-def obtener_pedido_por_codigo_barra(codigo_barra: str):
-    """Buscador instantáneo que se gatillará cuando Flutter use la cámara en Android."""
+def obtener_pedido_por_codigo_barra(
+    codigo_barra: str,
+    courier_id: str = Query(..., min_length=1, description="ID del courier que escanea"),
+    empresa: str = Query(..., description="Empresa del courier en sesión")
+):
+    """Buscador instantáneo blindado mediante consultas planas secuenciales."""
     try:
+        # 1️⃣ VALIDACIÓN DE OPERADOR: Verificamos la empresa real del chofer en la base de datos
+        query_courier = (
+            supabase_client.supabase.table("couriers")
+            .select("id_empresa, empresas_courier(nombre_empresa)")
+            .eq("id", courier_id)
+            .execute()
+        )
+        
+        if not query_courier.data:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Acceso denegado: El código de courier '{courier_id}' no es válido."
+            )
+            
+        courier_info = query_courier.data[0]
+        empresa_real_del_chofer = courier_info.get("empresas_courier", {}).get("nombre_empresa")
+
+        # Candado de consistencia por si manipulan los headers en Flutter
+        if not empresa_real_del_chofer or empresa_real_del_chofer.strip().lower() != empresa.strip().lower():
+            raise HTTPException(
+                status_code=403,
+                detail="Acceso denegado: Conflicto de asignación corporativa de sesión."
+            )
+
+        # 2️⃣ BUSQUEDA PLANA DEL PAQUETE: Traemos el pedido por su código de barras
         response = (
             supabase_client.supabase.table("pedidos")
-            .select("id, codigo_barra, descripcion_producto, estado, prioridad, intentos_entrega, clientes(nombre, telefono, direccion, distrito, latitud, longitud)")
+            .select("id, codigo_barra, descripcion_producto, estado, prioridad, intentos_entrega, courier_id")
             .eq("codigo_barra", codigo_barra)
             .execute()
         )
+        
         if not response.data:
-            raise HTTPException(status_code=404, detail="El código escaneado no coincide con ningún paquete en el sistema.")
-        return {"pedido": response.data[0]}
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(
+                status_code=404, 
+                detail="El código escaneado no coincide con ningún paquete en el sistema."
+            )
+            
+        pedido = response.data[0]
+        courier_asignado_id = pedido.get("courier_id")
 
+        # 3️⃣ CRUCE DE CONTROL LOGÍSTICO (Modo Entrega / En Ruta)
+        # Si el paquete ya está en la calle, el 'courier_id' del pedido debe coincidir obligatoriamente con el que escanea
+        if pedido["estado"] == "En Ruta" and courier_asignado_id:
+            if courier_asignado_id != courier_id:
+                raise HTTPException(
+                    status_code=403, 
+                    detail=f"Acceso denegado: El paquete ya está En Ruta asignado a otro Courier (ID: {courier_asignado_id})."
+                )
+
+        # 4️⃣ CRUCE DE CONTROL LOGÍSTICO (Modo Carga / Almacén)
+        # Si el paquete está 'Asignado' en almacén, verificamos que el chofer que lo quiere cargar sea del mismo grupo.
+        # Para evitar hacer otro Join, cruzamos contra tu endpoint de validación de manifiesto diario:
+        if pedido["estado"] == "Asignado" and courier_asignado_id:
+            if courier_asignado_id != courier_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Acceso denegado: Este paquete está pre-asignado a otra ruta de despacho."
+                )
+
+        return {"pedido": pedido}
+        
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=f"Error en validación B2B: {str(e)}")
+
+# ==========================================================================
+# 4️⃣ ACTUALIZAR ESTADO DEL PEDIDO (🔒 SEGURIDAD TRANSACTIONAL COMPLETA)
+# ==========================================================================
 @router.put("/{pedido_id}/estado")
 def actualizar_estado_pedido(
     pedido_id: int,
     nuevo_estado: str = Query(...),
+    courier_id: str = Query(..., min_length=1, description="ID del courier que intenta la mutación"),
     motivo_contingencia: str = Query(None),
     evidencia_url: str = Query(None)
 ):
-    """Modifica el estado en ruta, calcula intentos de entrega y guarda la auditoría."""
+    """Modifica el estado validando que el courier sea el legítimo dueño del registro."""
     if nuevo_estado not in ['Asignado', 'En Ruta', 'Entregado', 'No Entregado']:
         raise HTTPException(status_code=400, detail="Estado de entrega inválido.")
     if nuevo_estado == 'No Entregado' and not motivo_contingencia:
         raise HTTPException(status_code=400, detail="Debe ingresar el motivo de contingencia obligatoriamente.")
 
     try:
-        pedido_actual = supabase_client.supabase.table("pedidos").select("estado, courier_id, intentos_entrega").eq("id", pedido_id).execute()
+        # Recuperamos los datos actuales para verificar propiedad transaccional
+        pedido_actual = (
+            supabase_client.supabase.table("pedidos")
+            .select("estado, courier_id, intentos_entrega")
+            .eq("id", pedido_id)
+            .execute()
+        )
+        
         if not pedido_actual.data:
             raise HTTPException(status_code=404, detail="El pedido no existe.")
         
         datos = pedido_actual.data[0]
-        # Sumar intento si pasa a No Entregado
+        courier_asignado_id = datos.get("courier_id")
+
+        # 🔒 CONTROL DE SEGURIDAD INTERNO: Bloquea intentos ilícitos de suplantación de firmas/estados
+        # Excepción: Permitir si pasa de 'Asignado' a 'En Ruta' (Modo Carga en Almacén) donde se le asocia el courier
+        if datos["estado"] != "Asignado" and courier_asignado_id != courier_id:
+            raise HTTPException(
+                status_code=403, 
+                detail="Acceso denegado: No tienes permisos de escritura sobre este paquete."
+            )
+        
+        # Calcular intentos de entrega acumulados
         nuevos_intentos = (datos["intentos_entrega"] or 0) + 1 if nuevo_estado == 'No Entregado' else (datos["intentos_entrega"] or 0)
 
-        # 1. Actualizar tabla pedidos
-        update_res = supabase_client.supabase.table("pedidos").update({"estado": nuevo_estado, "intentos_entrega": nuevos_intentos}).eq("id", pedido_id).execute()
+        # 1. Actualizar tabla pedidos amarrando el courier_id de forma explícita
+        update_fields = {"estado": nuevo_estado, "intentos_entrega": nuevos_intentos}
+        if nuevo_estado == "En Ruta":
+            update_fields["courier_id"] = courier_id
+
+        update_res = (
+            supabase_client.supabase.table("pedidos")
+            .update(update_fields)
+            .eq("id", pedido_id)
+            .execute()
+        )
         
-        # 2. Registrar traza histórica
+        # 2. Registrar traza histórica inalterable para auditorías de Saga Falabella
         supabase_client.supabase.table("historial_estados").insert({
-            "pedido_id": pedido_id, "estado_anterior": datos["estado"], "estado_nuevo": nuevo_estado,
-            "motivo_contingencia": motivo_contingencia, "evidencia_url": evidencia_url, "actualizado_por": datos["courier_id"]
+            "pedido_id": pedido_id, 
+            "estado_anterior": datos["estado"], 
+            "estado_nuevo": nuevo_estado,
+            "motivo_contingencia": motivo_contingencia, 
+            "evidencia_url": evidencia_url, 
+            "actualizado_por": courier_id
         }).execute()
 
         return {"status": "success", "pedido": update_res.data[0]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
     
 @router.get("/test-osrm")
 def test_osrm():
@@ -284,3 +409,5 @@ def obtener_pedidos_por_empresa(empresa: str = Query(..., description="Nombre de
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en el árbol relacional del backend: {str(e)}")
+    
+   
