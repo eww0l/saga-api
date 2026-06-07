@@ -1,10 +1,21 @@
+import base64
 from fastapi import APIRouter, HTTPException, Query
 from database import supabase_client
 import requests
 # 📐 Importaciones matemáticas para calcular la distancia real por calles (Fórmula de Haversine)
 from math import radians, cos, sin, asin, sqrt
+from fastapi import APIRouter, HTTPException, Query, Body
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
+
+
+# Esquema para tipar el JSON de entrada
+class EvidenciaPayload(BaseModel):
+    foto_base64: str | None = None
 
 router = APIRouter(prefix="/api/pedidos", tags=["Pedidos Logística"])
+
 
 # 📐 FUNCIÓN AUXILIAR: Calcula la distancia en kilómetros entre dos coordenadas GPS
 def calcular_distancia_haversine(lat1, lon1, lat2, lon2):
@@ -278,24 +289,26 @@ def obtener_pedido_por_codigo_barra(
     except Exception as e: raise HTTPException(status_code=500, detail=f"Error en validación B2B: {str(e)}")
 
 # ==========================================================================
-# 4️⃣ ACTUALIZAR ESTADO DEL PEDIDO (🔒 SEGURIDAD TRANSACTIONAL COMPLETA)
+# 4️⃣ ACTUALIZAR ESTADO DEL PEDIDO (🔒 SOLUCIÓN OPERATIVA DEFINITIVA)
 # ==========================================================================
 @router.put("/{pedido_id}/estado")
 def actualizar_estado_pedido(
     pedido_id: int,
     nuevo_estado: str = Query(...),
-    courier_id: str = Query(..., min_length=1, description="ID del courier que intenta la mutación"),
+    courier_id: str = Query(None, description="ID del courier que intenta la mutación"),
     motivo_contingencia: str = Query(None),
-    evidencia_url: str = Query(None)
+    payload: Optional[EvidenciaPayload] = Body(None)
 ):
-    """Modifica el estado validando que el courier sea el legítimo dueño del registro."""
+    """Modifica el estado validando propiedad y procesa la foto opcional en cualquier flujo."""
     if nuevo_estado not in ['Asignado', 'En Ruta', 'Entregado', 'No Entregado']:
         raise HTTPException(status_code=400, detail="Estado de entrega inválido.")
     if nuevo_estado == 'No Entregado' and not motivo_contingencia:
         raise HTTPException(status_code=400, detail="Debe ingresar el motivo de contingencia obligatoriamente.")
 
+    # 💡 CORRECCIÓN CRÍTICA: Se eliminó el "raise HTTPException" que obligaba a mandar foto en 'Entregado'
+
     try:
-        # Recuperamos los datos actuales para verificar propiedad transaccional
+        # 1️⃣ Consulta plana del pedido
         pedido_actual = (
             supabase_client.supabase.table("pedidos")
             .select("estado, courier_id, intentos_entrega")
@@ -309,20 +322,67 @@ def actualizar_estado_pedido(
         datos = pedido_actual.data[0]
         courier_asignado_id = datos.get("courier_id")
 
-        # 🔒 CONTROL DE SEGURIDAD INTERNO: Bloquea intentos ilícitos de suplantación de firmas/estados
-        # Excepción: Permitir si pasa de 'Asignado' a 'En Ruta' (Modo Carga en Almacén) donde se le asocia el courier
-        if datos["estado"] != "Asignado" and courier_asignado_id != courier_id:
+        if datos["estado"] != "Asignado" and courier_asignado_id and courier_asignado_id != courier_id:
             raise HTTPException(
                 status_code=403, 
                 detail="Acceso denegado: No tienes permisos de escritura sobre este paquete."
             )
         
-        # Calcular intentos de entrega acumulados
+        # 2️⃣ Obtener el nombre de la empresa para la ruta del Storage
+        nombre_empresa = "general"
+        if courier_id:
+            query_courier = (
+                supabase_client.supabase.table("couriers")
+                .select("id_empresa, empresas_courier(nombre_empresa)")
+                .eq("id", courier_id)
+                .execute()
+            )
+            if query_courier.data:
+                c_info = query_courier.data[0]
+                emp_data = c_info.get("empresas_courier") or {}
+                if emp_data.get("nombre_empresa"):
+                    nombre_empresa = emp_data["nombre_empresa"].strip().lower().replace(" ", "_")
+
+        url_final_evidencia = None
+
+        # 📸 PROCESAMIENTO MULTIMEDIA SEGURO (Filtra nulos, objetos vacíos o textos "" en blanco)
+        if payload and getattr(payload, 'foto_base64', None) and payload.foto_base64.strip():
+            try:
+                encoded_data = payload.foto_base64.split(",")[-1] if "," in payload.foto_base64 else payload.foto_base64
+                imagen_bytes = base64.b64decode(encoded_data)
+                
+                timestamp = int(datetime.now().timestamp())
+                ruta_archivo = f"{nombre_empresa}/{datetime.now().strftime('%Y_%m')}/pedido_{pedido_id}_{timestamp}.jpg"
+                
+                bucket = supabase_client.supabase.storage.from_("comprobantes")
+                
+                # Subida al Storage de Supabase
+                bucket.upload(
+                    path=ruta_archivo,
+                    file=imagen_bytes,
+                    file_options={"content-type": "image/jpeg", "x-upsert": "true"}
+                )
+                
+                url_res = bucket.get_public_url(ruta_archivo)
+                if isinstance(url_res, dict) and "publicUrl" in url_res:
+                    url_final_evidencia = url_res["publicUrl"]
+                else:
+                    url_final_evidencia = str(url_res)
+
+            except Exception as img_err:
+                print(f"🚨 ERROR EN CAPTURA DE URL STORAGE: {str(img_err)}")
+                raise HTTPException(status_code=500, detail=f"Error en almacenamiento de foto: {str(img_err)}")
+
+        # 🎯 CONTROL DE ENTRADA EN HISTORIAL
+        # Si no hay foto en el Storage pero es un fallo corporativo, asignamos el motivo como fallback
+        if not url_final_evidencia and motivo_contingencia:
+            url_final_evidencia = motivo_contingencia
+
         nuevos_intentos = (datos["intentos_entrega"] or 0) + 1 if nuevo_estado == 'No Entregado' else (datos["intentos_entrega"] or 0)
 
-        # 1. Actualizar tabla pedidos amarrando el courier_id de forma explícita
+        # 3️⃣ Actualizar tabla pedidos
         update_fields = {"estado": nuevo_estado, "intentos_entrega": nuevos_intentos}
-        if nuevo_estado == "En Ruta":
+        if nuevo_estado == "En Ruta" and courier_id:
             update_fields["courier_id"] = courier_id
 
         update_res = (
@@ -332,21 +392,23 @@ def actualizar_estado_pedido(
             .execute()
         )
         
-        # 2. Registrar traza histórica inalterable para auditorías de Saga Falabella
+        # 4️⃣ Insertar en historial de estados sin fallas relacionales
         supabase_client.supabase.table("historial_estados").insert({
             "pedido_id": pedido_id, 
             "estado_anterior": datos["estado"], 
             "estado_nuevo": nuevo_estado,
             "motivo_contingencia": motivo_contingencia, 
-            "evidencia_url": evidencia_url, 
-            "actualizado_por": courier_id
+            "evidencia_url": url_final_evidencia, 
+            "actualizado_por": courier_id 
         }).execute()
 
         return {"status": "success", "pedido": update_res.data[0]}
         
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-    
+    except HTTPException as http_ex:
+        raise http_ex
+    except Exception as e:
+        print(f"🚨 ERROR CRÍTICO EN HISTORIAL: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 @router.get("/test-osrm")
 def test_osrm():
 
